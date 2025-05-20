@@ -1,12 +1,31 @@
-# app.py
+#Todo:
+#Minor things: 
+#   Adding back loading bar during analysis
+#Major things:
+#   Find what is similar to the One log and what is discarded
+#   Based on what its decided
+#   Field identification 
+
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 import re
 import matplotlib.pyplot as plt
 import io
+
+# Import backend utilities (excluding load_positive_examples)
+from model.model_utils.model_utils import (
+    load_model,
+    normalize_text,
+    compute_similarities,
+    build_results_df,
+    load_positive_examples,
+    get_similarity_breakdown,
+    enhanced_similarity,
+    extract_log_fields,
+    highlight_text
+)
 
 # Set page config
 st.set_page_config(
@@ -45,53 +64,6 @@ st.markdown("""
     <div class="beta-tag">Beta</div>
 </div>
 """, unsafe_allow_html=True)
-
-# Cache the model loading
-@st.cache_resource
-def load_model():
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-# Text normalization function
-def normalize_text(text):
-    """
-    Normalize log text by removing timestamps, IPs, and numbers
-    to focus on the semantic content
-    """
-    if pd.isna(text):
-        return ""
-    
-    text = str(text)
-    
-    # Remove timestamps (various formats)
-    text = re.sub(r'\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}', '', text)
-    text = re.sub(r'\d{2}/\d{2}/\d{4}\s\d{2}:\d{2}:\d{2}', '', text)
-    text = re.sub(r'\d{1,2}/\d{1,2}/\d{2,4}', '', text)
-    text = re.sub(r'\d{2}:\d{2}:\d{2}', '', text)
-    
-    # Remove IP addresses
-    text = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '', text)
-    
-    # Remove ports
-    text = re.sub(r':\d{1,5}\b', '', text)
-    
-    # Remove standalone numbers (but keep numbers that are part of words)
-    text = re.sub(r'\b\d+\b', '', text)
-    
-    # Remove extra whitespace
-    text = ' '.join(text.split())
-    
-    return text
-
-# Load positive examples (you'll need to have this file in your app directory)
-@st.cache_data
-def load_positive_examples():
-    try:
-        df = pd.read_csv('failed_login_logs.csv')
-        df['normalized_log'] = df['Log'].apply(normalize_text)
-        return df
-    except FileNotFoundError:
-        st.error("failed_login_logs.csv not found. Please ensure it's in the app directory.")
-        return None
 
 # Main app
 def main():
@@ -136,14 +108,11 @@ def main():
     )
     
     if uploaded_file is not None:
-        # Read the uploaded file
         try:
+            # Read the uploaded file
             if uploaded_file.name.endswith('.csv'):
                 df = pd.read_csv(uploaded_file)
-                if len(df.columns) > 1:
-                    log_lines = df.iloc[:, -1].tolist()
-                else:
-                    log_lines = df.iloc[:, 0].tolist()
+                log_lines = df.iloc[:, -1].tolist() if len(df.columns) > 1 else df.iloc[:, 0].tolist()
             else:
                 content = uploaded_file.read().decode('utf-8')
                 log_lines = [line.strip() for line in content.split('\n') if line.strip()]
@@ -165,44 +134,22 @@ def main():
                     positive_texts = positive_examples_df['normalized_log'].tolist()
                     normalized_log_lines = [normalize_text(line) for line in log_lines]
                     
-                    # Compute embeddings
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+                    # Compute similarities
+                    max_similarities, most_similar_idx = compute_similarities(
+                        model, positive_texts, normalized_log_lines
+                    )
                     
-                    status_text.text("Computing embeddings for positive examples...")
-                    positive_embeddings = model.encode(positive_texts)
-                    progress_bar.progress(33)
-                    
-                    status_text.text("Computing embeddings for log lines...")
-                    target_embeddings = model.encode(normalized_log_lines)
-                    progress_bar.progress(66)
-                    
-                    status_text.text("Computing similarities...")
-                    similarities = cosine_similarity(target_embeddings, positive_embeddings)
-                    max_similarities = np.max(similarities, axis=1)
-                    most_similar_positive_idx = np.argmax(similarities, axis=1)
-                    progress_bar.progress(100)
-                    
-                    # Create results DataFrame
-                    results_df = pd.DataFrame({
-                        'original_log_line': log_lines,
-                        'normalized_log_line': normalized_log_lines,
-                        'max_similarity_score': max_similarities,
-                        'most_similar_positive_idx': most_similar_positive_idx,
-                        'most_similar_positive_example': [positive_examples_df.iloc[idx]['Log'] for idx in most_similar_positive_idx]
-                    })
-                    
-                    # Sort by similarity score
-                    results_df = results_df.sort_values('max_similarity_score', ascending=False)
-                    
-                    # Clear progress indicators
-                    progress_bar.empty()
-                    status_text.empty()
+                    # Build and sort results
+                    results_df = build_results_df(
+                        log_lines,
+                        normalized_log_lines,
+                        max_similarities,
+                        most_similar_idx,
+                        positive_examples_df
+                    )
                     
                     # Display results
                     st.header("📊 Analysis Results")
-                    
-                    # Summary statistics
                     col1, col2, col3, col4 = st.columns(4)
                     with col1:
                         st.metric("Total Log Lines", len(results_df))
@@ -215,33 +162,49 @@ def main():
                     
                     # Top results
                     st.subheader(f"Top {top_n} Most Likely Failed Login Events")
-                    
-                    for idx, row in results_df.head(top_n).iterrows():
+                    for _, row in results_df.head(top_n).iterrows():
+                        
                         score = row['max_similarity_score']
                         color = "red" if score >= confidence_threshold else "orange"
-                        
+                        # Get similarity breakdown
+                        breakdown = get_similarity_breakdown(
+                            model, 
+                            row['original_log_line'], 
+                            row['most_similar_positive_example']
+                        )
                         with st.container():
-                            col1, col2 = st.columns([1, 5])
-                            with col1:
-                                st.markdown(f"**Score:** :{color}[{score:.4f}]")
-                            with col2:
-                                st.text(row['original_log_line'])
-                                with st.expander("Details"):
-                                    st.write("**Normalized version:**")
-                                    st.text(row['normalized_log_line'])
-                                    st.write("**Most similar to:**")
-                                    st.text(row['most_similar_positive_example'])
+                            st.markdown(f"**Score:** :{color}[{score:.4f}]")
+                            
+                            # Display original log with highlights
+                            st.markdown("**Original Log:**")
+                            highlighted = highlight_text(
+                                row['original_log_line'], 
+                                breakdown['common_tokens']
+                            )
+                            st.markdown(highlighted, unsafe_allow_html=True)
+                            # Display details in expander
+                            with st.expander("Detailed Analysis"):
+                                st.markdown("**Matching Components:**")
+                                st.write(list(breakdown['common_tokens']))
+                                
+                                st.markdown("**Unique to This Log:**")
+                                st.write(list(breakdown['unique_to_log']))
+                                
+                                st.markdown("**Unique to Example:**")
+                                st.write(list(breakdown['unique_to_example']))
+                                
+                                st.markdown("**Field Extraction:**")
+                                st.write(extract_log_fields(row['original_log_line']))
                             st.divider()
                     
                     # Visualization
                     st.subheader("📈 Similarity Score Distribution")
-                    
                     fig, ax = plt.subplots(figsize=(10, 6))
                     ax.hist(results_df['max_similarity_score'], bins=50, edgecolor='black', alpha=0.7)
                     ax.axvline(x=confidence_threshold, color='red', linestyle='--', 
                               label=f'Threshold: {confidence_threshold}')
                     ax.axvline(x=results_df['max_similarity_score'].mean(), color='green', linestyle='--', 
-                              label=f'Mean: {results_df["max_similarity_score"].mean():.3f}')
+                              label=f"Mean: {results_df['max_similarity_score'].mean():.3f}")
                     ax.set_xlabel('Similarity Score')
                     ax.set_ylabel('Frequency')
                     ax.set_title('Distribution of Similarity Scores')
@@ -252,7 +215,6 @@ def main():
                     st.subheader("🎯 Threshold Analysis")
                     thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
                     threshold_data = []
-                    
                     for threshold in thresholds:
                         count = len(results_df[results_df['max_similarity_score'] >= threshold])
                         percentage = (count / len(results_df)) * 100
@@ -261,36 +223,29 @@ def main():
                             'Count': count,
                             'Percentage': f"{percentage:.1f}%"
                         })
-                    
                     threshold_df = pd.DataFrame(threshold_data)
                     st.dataframe(threshold_df, use_container_width=True)
                     
                     # Download results
                     st.subheader("💾 Download Results")
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        # Full results CSV
-                        csv = results_df.to_csv(index=False)
+                    dcol1, dcol2 = st.columns(2)
+                    with dcol1:
+                        csv_all = results_df.to_csv(index=False)
                         st.download_button(
                             label="Download Full Results (CSV)",
-                            data=csv,
+                            data=csv_all,
                             file_name="failed_login_analysis_results.csv",
                             mime="text/csv"
                         )
-                    
-                    with col2:
-                        # High confidence results only
-                        high_confidence_df = results_df[results_df['max_similarity_score'] >= confidence_threshold]
-                        csv_high = high_confidence_df.to_csv(index=False)
+                    with dcol2:
+                        high_conf_df = results_df[results_df['max_similarity_score'] >= confidence_threshold]
+                        csv_high = high_conf_df.to_csv(index=False)
                         st.download_button(
                             label=f"Download High Confidence Results (Score >= {confidence_threshold})",
                             data=csv_high,
                             file_name=f"high_confidence_failed_logins_{confidence_threshold}.csv",
                             mime="text/csv"
                         )
-                    
         except Exception as e:
             st.error(f"Error processing file: {str(e)}")
     
